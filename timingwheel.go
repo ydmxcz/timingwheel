@@ -1,56 +1,70 @@
 package timingwheel
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
-	"github.com/RussellLuo/timingwheel/delayqueue"
+	"github.com/ydmxcz/gds/collections/delayqueue"
 )
 
-// TimingWheel is an implementation of Hierarchical Timing Wheels.
+// 分层时间轮
 type TimingWheel struct {
-	tick      int64 // in milliseconds
-	wheelSize int64
+	tick      int64 // 每一个时间格的跨度,以毫秒为单位
+	wheelSize int64 // 时间格的数量
 
-	interval    int64 // in milliseconds
-	currentTime int64 // in milliseconds
-	buckets     []*bucket
-	queue       *delayqueue.DelayQueue
+	interval    int64                           // 总的跨度数 tick * wheelSize，以毫秒为单位
+	currentTime int64                           // 当前指针指向的时间，以毫秒为单位
+	buckets     []*bucket                       //时间格列表
+	queue       *delayqueue.DelayQueue[*bucket] //延迟队列,
 
-	// The higher-level overflow wheel.
-	//
-	// NOTE: This field may be updated and read concurrently, through Add().
-	overflowWheel unsafe.Pointer // type: *TimingWheel
+	overflowWheel unsafe.Pointer // 上一层时间轮的指针
 
-	exitC     chan struct{}
-	waitGroup waitGroupWrapper
+	ctx context.Context
+	cf  context.CancelFunc
 }
 
-// NewTimingWheel creates an instance of TimingWheel with the given tick and wheelSize.
-func NewTimingWheel(tick time.Duration, wheelSize int64) *TimingWheel {
+// 对外暴露的初始化时间轮方法,参数为时间格跨度，和时间格数量
+func New(tick time.Duration, wheelSize int64) *TimingWheel {
+	//时间格(毫秒)
 	tickMs := int64(tick / time.Millisecond)
 	if tickMs <= 0 {
 		panic(errors.New("tick must be greater than or equal to 1ms"))
 	}
 
-	startMs := timeToMs(time.Now().UTC())
+	//开始时间
+	startMs := time.Now().UnixMilli()
 
 	return newTimingWheel(
 		tickMs,
 		wheelSize,
 		startMs,
-		delayqueue.New(int(wheelSize)),
+		delayqueue.NewDelayQueue(func(a, b *bucket) int {
+			if a == b {
+				return 0
+			}
+			return 1
+		}, 8), //delayqueue
 	)
 }
 
-// newTimingWheel is an internal helper function that really creates an instance of TimingWheel.
-func newTimingWheel(tickMs int64, wheelSize int64, startMs int64, queue *delayqueue.DelayQueue) *TimingWheel {
+func truncate(expiration, tick int64) int64 {
+	if tick < 0 {
+		return expiration
+	}
+	return expiration - (expiration % tick)
+}
+
+func newTimingWheel(tickMs int64, wheelSize int64, startMs int64, queue *delayqueue.DelayQueue[*bucket]) *TimingWheel {
+	//根据时间格数量创建时间格列表
 	buckets := make([]*bucket, wheelSize)
 	for i := range buckets {
 		buckets[i] = newBucket()
 	}
+	ctx, cf := context.WithCancel(context.Background())
 	return &TimingWheel{
 		tick:        tickMs,
 		wheelSize:   wheelSize,
@@ -58,36 +72,43 @@ func newTimingWheel(tickMs int64, wheelSize int64, startMs int64, queue *delayqu
 		interval:    tickMs * wheelSize,
 		buckets:     buckets,
 		queue:       queue,
-		exitC:       make(chan struct{}),
+		ctx:         ctx,
+		cf:          cf,
 	}
 }
 
-// add inserts the timer t into the current timing wheel.
-func (tw *TimingWheel) add(t *Timer) bool {
+func (tw *TimingWheel) Start() {
+	go func() {
+		for {
+			b, ok := tw.queue.PopWithCtx(tw.ctx)
+			if !ok {
+				fmt.Println("down")
+				return
+			}
+			tw.advanceClock(b.Expiration())
+			b.Flush(tw.addOrRun)
+
+		}
+	}()
+}
+
+func (tw *TimingWheel) add(t *Event) bool {
 	currentTime := atomic.LoadInt64(&tw.currentTime)
 	if t.expiration < currentTime+tw.tick {
-		// Already expired
 		return false
 	} else if t.expiration < currentTime+tw.interval {
-		// Put it into its own bucket
+
 		virtualID := t.expiration / tw.tick
+
 		b := tw.buckets[virtualID%tw.wheelSize]
 		b.Add(t)
 
-		// Set the bucket expiration time
 		if b.SetExpiration(virtualID * tw.tick) {
-			// The bucket needs to be enqueued since it was an expired bucket.
-			// We only need to enqueue the bucket when its expiration time has changed,
-			// i.e. the wheel has advanced and this bucket get reused with a new expiration.
-			// Any further calls to set the expiration within the same wheel cycle will
-			// pass in the same value and hence return false, thus the bucket with the
-			// same expiration will not be enqueued multiple times.
-			tw.queue.Offer(b, b.Expiration())
+			tw.queue.Push(b)
 		}
 
 		return true
 	} else {
-		// Out of the interval. Put it into the overflow wheel
 		overflowWheel := atomic.LoadPointer(&tw.overflowWheel)
 		if overflowWheel == nil {
 			atomic.CompareAndSwapPointer(
@@ -106,25 +127,21 @@ func (tw *TimingWheel) add(t *Timer) bool {
 	}
 }
 
-// addOrRun inserts the timer t into the current timing wheel, or run the
-// timer's task if it has already expired.
-func (tw *TimingWheel) addOrRun(t *Timer) {
+func (tw *TimingWheel) addOrRun(t *Event) {
 	if !tw.add(t) {
-		// Already expired
-
-		// Like the standard time.AfterFunc (https://golang.org/pkg/time/#AfterFunc),
-		// always execute the timer's task in its own goroutine.
 		go t.task()
 	}
 }
 
 func (tw *TimingWheel) advanceClock(expiration int64) {
 	currentTime := atomic.LoadInt64(&tw.currentTime)
+
 	if expiration >= currentTime+tw.tick {
+
 		currentTime = truncate(expiration, tw.tick)
 		atomic.StoreInt64(&tw.currentTime, currentTime)
 
-		// Try to advance the clock of the overflow wheel if present
+		// 如果有上层时间轮，那么递归调用上层时间轮的引用
 		overflowWheel := atomic.LoadPointer(&tw.overflowWheel)
 		if overflowWheel != nil {
 			(*TimingWheel)(overflowWheel).advanceClock(currentTime)
@@ -132,43 +149,15 @@ func (tw *TimingWheel) advanceClock(expiration int64) {
 	}
 }
 
-// Start starts the current timing wheel.
-func (tw *TimingWheel) Start() {
-	tw.waitGroup.Wrap(func() {
-		tw.queue.Poll(tw.exitC, func() int64 {
-			return timeToMs(time.Now().UTC())
-		})
-	})
-
-	tw.waitGroup.Wrap(func() {
-		for {
-			select {
-			case elem := <-tw.queue.C:
-				b := elem.(*bucket)
-				tw.advanceClock(b.Expiration())
-				b.Flush(tw.addOrRun)
-			case <-tw.exitC:
-				return
-			}
-		}
-	})
-}
-
-// Stop stops the current timing wheel.
-//
-// If there is any timer's task being running in its own goroutine, Stop does
-// not wait for the task to complete before returning. If the caller needs to
-// know whether the task is completed, it must coordinate with the task explicitly.
 func (tw *TimingWheel) Stop() {
-	close(tw.exitC)
-	tw.waitGroup.Wait()
+	tw.cf()
 }
 
-// AfterFunc waits for the duration to elapse and then calls f in its own goroutine.
-// It returns a Timer that can be used to cancel the call using its Stop method.
-func (tw *TimingWheel) AfterFunc(d time.Duration, f func()) *Timer {
-	t := &Timer{
-		expiration: timeToMs(time.Now().UTC().Add(d)),
+// 添加定时任务到时间轮
+func (tw *TimingWheel) AfterFunc(d time.Duration, f func()) *Event {
+
+	t := &Event{
+		expiration: time.Now().Add(d).UnixMilli(), //timeToMs(time.Now().UTC().Add(d)),
 		task:       f,
 	}
 	tw.addOrRun(t)
@@ -199,20 +188,20 @@ type Scheduler interface {
 // Afterwards, it will ask the next execution time each time f is about to
 // be executed, and f will be called at the next execution time if the time
 // is non-zero.
-func (tw *TimingWheel) ScheduleFunc(s Scheduler, f func()) (t *Timer) {
+func (tw *TimingWheel) ScheduleFunc(s Scheduler, f func()) (t *Event) {
 	expiration := s.Next(time.Now().UTC())
 	if expiration.IsZero() {
 		// No time is scheduled, return nil.
 		return
 	}
 
-	t = &Timer{
-		expiration: timeToMs(expiration),
+	t = &Event{
+		expiration: expiration.UnixMilli(),
 		task: func() {
 			// Schedule the task to execute at the next time if possible.
 			expiration := s.Next(msToTime(t.expiration))
 			if !expiration.IsZero() {
-				t.expiration = timeToMs(expiration)
+				t.expiration = expiration.UnixMilli()
 				tw.addOrRun(t)
 			}
 
@@ -223,4 +212,10 @@ func (tw *TimingWheel) ScheduleFunc(s Scheduler, f func()) (t *Timer) {
 	tw.addOrRun(t)
 
 	return
+}
+
+// msToTime returns the UTC time corresponding to the given Unix time,
+// t milliseconds since January 1, 1970 UTC.
+func msToTime(t int64) time.Time {
+	return time.Unix(0, t*int64(time.Millisecond)).UTC()
 }

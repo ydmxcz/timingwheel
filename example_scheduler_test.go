@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/RussellLuo/timingwheel"
+	"github.com/ydmxcz/timingwheel"
 )
 
 type EveryScheduler struct {
@@ -16,7 +16,7 @@ func (s *EveryScheduler) Next(prev time.Time) time.Time {
 }
 
 func Example_scheduleTimer() {
-	tw := timingwheel.NewTimingWheel(time.Millisecond, 20)
+	tw := timingwheel.New(time.Millisecond, 20)
 	tw.Start()
 	defer tw.Stop()
 

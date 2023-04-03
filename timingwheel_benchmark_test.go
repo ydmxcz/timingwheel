@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RussellLuo/timingwheel"
+	"github.com/ydmxcz/timingwheel"
 )
 
 func genD(i int) time.Duration {
@@ -12,7 +12,7 @@ func genD(i int) time.Duration {
 }
 
 func BenchmarkTimingWheel_StartStop(b *testing.B) {
-	tw := timingwheel.NewTimingWheel(time.Millisecond, 20)
+	tw := timingwheel.New(time.Millisecond, 20)
 	tw.Start()
 	defer tw.Stop()
 
@@ -26,7 +26,7 @@ func BenchmarkTimingWheel_StartStop(b *testing.B) {
 	}
 	for _, c := range cases {
 		b.Run(c.name, func(b *testing.B) {
-			base := make([]*timingwheel.Timer, c.N)
+			base := make([]*timingwheel.Event, c.N)
 			for i := 0; i < len(base); i++ {
 				base[i] = tw.AfterFunc(genD(i), func() {})
 			}
