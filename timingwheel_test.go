@@ -4,11 +4,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RussellLuo/timingwheel"
+	"github.com/ydmxcz/timingwheel"
 )
 
 func TestTimingWheel_AfterFunc(t *testing.T) {
-	tw := timingwheel.NewTimingWheel(time.Millisecond, 20)
+	tw := timingwheel.New(time.Millisecond, 20)
 	tw.Start()
 	defer tw.Stop()
 
@@ -56,7 +56,7 @@ func (s *scheduler) Next(prev time.Time) time.Time {
 }
 
 func TestTimingWheel_ScheduleFunc(t *testing.T) {
-	tw := timingwheel.NewTimingWheel(time.Millisecond, 20)
+	tw := timingwheel.New(time.Millisecond, 20)
 	tw.Start()
 	defer tw.Stop()
 

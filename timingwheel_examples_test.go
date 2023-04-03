@@ -4,11 +4,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/RussellLuo/timingwheel"
+	"github.com/ydmxcz/timingwheel"
 )
 
 func Example_startTimer() {
-	tw := timingwheel.NewTimingWheel(time.Millisecond, 20)
+	tw := timingwheel.New(time.Millisecond, 20)
 	tw.Start()
 	defer tw.Stop()
 
@@ -25,7 +25,7 @@ func Example_startTimer() {
 }
 
 func Example_stopTimer() {
-	tw := timingwheel.NewTimingWheel(time.Millisecond, 20)
+	tw := timingwheel.New(time.Millisecond, 20)
 	tw.Start()
 	defer tw.Stop()
 
